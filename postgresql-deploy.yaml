@@ -4,36 +4,71 @@ metadata:
   name: postgresql-db
 ---
 apiVersion: v1
-kind: PersistentVolume # Create PV 
+kind: ServiceAccount
 metadata:
-  name: postgres-volume # Sets PV name
+  name: postgres-sa
   namespace: postgresql-db
-  labels:
-    type: local # Sets PV's type
-    app: postgres
-spec:
-  storageClassName: manual
-  capacity:
-    storage: 10Gi # Sets PV's size
-  accessModes:
-    - ReadWriteMany
-  hostPath:
-    path: "/data/postgresql" # Sets PV's host path
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: postgresql-db
+  name: postgres-role
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "watch", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: postgres-rolebinding
+  namespace: postgresql-db
+subjects:
+- kind: ServiceAccount
+  name: postgres-sa
+  namespace: postgresql-db
+roleRef:
+  kind: Role
+  name: postgres-role
+  apiGroup: rbac.authorization.k8s.io
+
 ---
 apiVersion: v1
-kind: PersistentVolumeClaim # Create PVC
+kind: PersistentVolume
+metadata:
+  name: local-pv
+spec:
+  capacity:
+    storage: 2Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: local-path
+  local:
+    path: /tmp
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: node-role.kubernetes.io/worker
+              operator: Exists
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
 metadata:
   namespace: postgresql-db
-  name: postgres-volume-claim # Sets PVC's name
+  name: postgres-volume-claim
   labels:
-    app: postgres # Defines app to create PVC for
+    app: postgres
 spec:
-  storageClassName: manual
+  storageClassName: local-path
   accessModes:
-    - ReadWriteMany
+    - ReadWriteOnce
   resources:
     requests:
-      storage: 10Gi # Sets PVC's size
+      storage: 2Gi
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -48,12 +83,12 @@ data:
   POSTGRES_PASSWORD: strongpasswordapp
 ---
 apiVersion: apps/v1
-kind: Deployment # Create a deployment
+kind: Deployment
 metadata:
   namespace: postgresql-db
-  name: postgres # Set the name of the deployment
+  name: postgres
 spec:
-  replicas: 3 # Set 3 deployment replicas
+  replicas: 1
   selector:
     matchLabels:
       app: postgres
@@ -62,33 +97,79 @@ spec:
       labels:
         app: postgres
     spec:
+      securityContext:
+        fsGroup: 1000670000 # - tmp fsgroup
+                #1000810000 - ps fsgroup
+      serviceAccountName: postgres-sa
       containers:
         - name: postgres
-          image: postgres:12.10 # Docker image
+          image: postgres:12.10
           imagePullPolicy: "IfNotPresent"
           ports:
-            - containerPort: 5432 # Exposing the container port 5432 for PostgreSQL client connections.
+            - containerPort: 5432
           envFrom:
             - configMapRef:
-                name: postgres-secret # Using the ConfigMap postgres-secret
+                name: postgres-secret
           volumeMounts:
             - mountPath: /var/lib/postgresql/data
               name: postgresdata
+              subPath: postgres
       volumes:
         - name: postgresdata
           persistentVolumeClaim:
             claimName: postgres-volume-claim
 ---
 apiVersion: v1
-kind: Service # Create service
+kind: Service
 metadata:
-  name: postgres # Sets the service name
+  name: postgres
   namespace: postgresql-db
   labels:
-    app: postgres # Defines app to create service for
+    app: postgres
 spec:
-  type: NodePort # Sets the service type
+  type: ClusterIP
   ports:
-    - port: 5432 # Sets the port to run the postgres application
+    - port: 5432
   selector:
     app: postgres
+---
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: postgres-scc
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+allowPrivilegedContainer: false
+allowedCapabilities: null
+apiGroups: null
+defaultAddCapabilities: null
+fsGroup:
+  type: RunAsAny
+groups: []
+priority: null
+readOnlyRootFilesystem: false
+requiredDropCapabilities:
+- KILL
+- MKNOD
+- SYS_CHROOT
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: MustRunAs
+seccompProfiles:
+- docker/default
+supplementalGroups:
+  type: RunAsAny
+users:
+- system:serviceaccount:postgresql-db:postgres-sa
+volumes:
+- configMap
+- downwardAPI
+- emptyDir
+- persistentVolumeClaim
+- projected
+- secret
+
